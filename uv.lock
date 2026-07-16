@@ -483,7 +483,7 @@ wheels = [
 
 [[package]]
 name = "datacurve-pier"
-version = "0.3.0.post1"
+version = "0.3.0.post2"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

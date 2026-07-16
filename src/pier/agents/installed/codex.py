@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -36,9 +37,29 @@ from pier.utils.trajectory_metrics import (
 )
 from pier.utils.trajectory_utils import format_trajectory_json
 
+from .codex_checkpoint import (
+    CheckpointError,
+    CheckpointIncompatibleError,
+    append_event,
+    load_manifest,
+    new_manifest,
+    read_events,
+    safe_artifact_path,
+    snapshot_script,
+    update_manifest,
+    write_manifest,
+)
+
 _COMPACTION_DROP_TOKEN_THRESHOLD = 10_000
 _MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model."
 _MODEL_CAPACITY_RETRY_DELAYS = (30, 60, 120)
+_SESSION_UNAVAILABLE_MARKERS = (
+    "session not found",
+    "conversation not found",
+    "no rollout found",
+    "failed to load session",
+    "could not find session",
+)
 
 
 def _iter_jsonl_events(output: str):
@@ -110,12 +131,33 @@ class Codex(BaseInstalledAgent):
         command_model_name: str | None = None,
         config_toml: str | None = None,
         config_toml_file: str | None = None,
+        checkpoint_enabled: str | bool = False,
+        checkpoint_assignment_id: str | None = None,
+        checkpoint_task_id: str | None = None,
+        checkpoint_effort: str | None = None,
+        checkpoint_resume_generation: str | int = 0,
+        checkpoint_path: str | None = None,
+        checkpoint_interval_sec: str | int = 30,
+        checkpoint_workdir: str = "/app",
         **kwargs,
     ):
         self._command_model_name = command_model_name
         self._config_toml = config_toml
         if config_toml_file:
             self._config_toml = Path(config_toml_file).read_text()
+        self._checkpoint_enabled = parse_bool_env_value(
+            checkpoint_enabled, name="checkpoint_enabled", default=False
+        )
+        self._checkpoint_assignment_id = checkpoint_assignment_id
+        self._checkpoint_task_id = checkpoint_task_id
+        self._checkpoint_effort = checkpoint_effort
+        self._checkpoint_resume_generation = int(checkpoint_resume_generation)
+        if self._checkpoint_resume_generation < 0:
+            raise ValueError("checkpoint_resume_generation must be non-negative")
+        self._resume_checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+        self._checkpoint_interval_sec = max(10, min(int(checkpoint_interval_sec), 300))
+        self._checkpoint_workdir = checkpoint_workdir
+        self._checkpoint_manifest_path: Path | None = None
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -1025,6 +1067,11 @@ class Codex(BaseInstalledAgent):
             self.logger.debug("Failed to convert Codex session to trajectory")
             return
 
+        checkpoint_events = read_events(self._checkpoint_host_dir)
+        if checkpoint_events:
+            trajectory.extra = dict(trajectory.extra or {})
+            trajectory.extra["checkpoint_events"] = checkpoint_events
+
         trajectory_path = self.logs_dir / "trajectory.json"
         try:
             with open(trajectory_path, "w") as handle:
@@ -1094,12 +1141,271 @@ class Codex(BaseInstalledAgent):
 
         return None
 
+    @property
+    def _checkpoint_host_dir(self) -> Path:
+        return self.logs_dir / "checkpoint"
+
+    @property
+    def _checkpoint_remote_dir(self) -> PurePosixPath:
+        return EnvironmentPaths.agent_dir / "checkpoint"
+
+    def _checkpoint_event(self, event: str, **detail: Any) -> None:
+        if not self._checkpoint_enabled or self._checkpoint_manifest_path is None:
+            return
+        append_event(self._checkpoint_host_dir, event, **detail)
+
+    def _checkpoint_root_thread_id(self, checkpoint_dir: Path) -> str | None:
+        try:
+            manifest = load_manifest(checkpoint_dir / "checkpoint.json")
+        except CheckpointError:
+            return None
+        root = manifest.get("root_thread_id")
+        if isinstance(root, str) and root:
+            return root
+        output_path = checkpoint_dir.parent / self._OUTPUT_FILENAME
+        if output_path.is_symlink() or not output_path.is_file():
+            return None
+        return _root_thread_id(output_path.read_text(errors="replace"))
+
+    def _session_unavailable(self) -> bool:
+        output_path = self.logs_dir / self._OUTPUT_FILENAME
+        text = output_path.read_text(errors="replace") if output_path.is_file() else ""
+        low = text.lower()
+        return any(marker in low for marker in _SESSION_UNAVAILABLE_MARKERS)
+
+    async def _current_base_commit(
+        self, environment: BaseEnvironment, env: dict[str, str]
+    ) -> str:
+        result = await self.exec_as_agent(
+            environment,
+            command=f"git -C {shlex.quote(self._checkpoint_workdir)} rev-parse HEAD",
+            env=env,
+        )
+        base = (result.stdout or "").strip()
+        if not base:
+            raise CheckpointIncompatibleError("checkpoint worktree is not a git repository")
+        return base
+
+    async def _restore_checkpoint(
+        self,
+        environment: BaseEnvironment,
+        env: dict[str, str],
+        previous_dir: Path,
+        previous: dict[str, Any],
+        base_commit: str,
+    ) -> None:
+        expected = previous.get("base_commit")
+        if expected != base_commit:
+            raise CheckpointIncompatibleError(
+                f"task base changed: checkpoint={expected!r}, current={base_commit!r}"
+            )
+
+        remote_restore = "/tmp/pier-checkpoint-restore"
+        await self.exec_as_agent(
+            environment,
+            command=f"rm -rf {remote_restore} && mkdir -p {remote_restore}",
+            env=env,
+        )
+        patch_path = safe_artifact_path(
+            previous_dir, str(previous.get("workspace_patch", "workspace.patch"))
+        )
+        if patch_path.is_file() and patch_path.stat().st_size:
+            remote_patch = f"{remote_restore}/workspace.patch"
+            await environment.upload_file(patch_path, remote_patch)
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"git -C {shlex.quote(self._checkpoint_workdir)} apply --binary "
+                    f"{remote_patch}"
+                ),
+                env=env,
+            )
+
+        archive_path = safe_artifact_path(
+            previous_dir,
+            str(previous.get("untracked_archive", "untracked.tar.gz")),
+        )
+        if archive_path.is_file() and archive_path.stat().st_size:
+            remote_archive = f"{remote_restore}/untracked.tar.gz"
+            await environment.upload_file(archive_path, remote_archive)
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"tar -xzf {remote_archive} -C "
+                    f"{shlex.quote(self._checkpoint_workdir)}"
+                ),
+                env=env,
+            )
+
+        sessions_path = safe_artifact_path(
+            previous_dir, str(previous.get("sessions_dir", "sessions"))
+        )
+        if sessions_path.is_dir():
+            await self.exec_as_agent(
+                environment,
+                command='mkdir -p "$CODEX_HOME/sessions"',
+                env=env,
+            )
+            await environment.upload_dir(sessions_path, f"{self._REMOTE_CODEX_HOME}/sessions")
+            if environment.default_user is not None:
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        f"chown -R {environment.default_user} "
+                        f"{shlex.quote(str(self._REMOTE_CODEX_HOME / 'sessions'))}"
+                    ),
+                    env=env,
+                )
+
+        self._checkpoint_event(
+            "workspace_restored",
+            previous_phase=previous.get("phase"),
+            previous_resume_count=previous.get("resume_count", 0),
+        )
+
+    async def _start_checkpoint(
+        self, environment: BaseEnvironment, env: dict[str, str]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not self._checkpoint_enabled:
+            return None, None
+        if not self._checkpoint_assignment_id:
+            raise CheckpointError("checkpoint_assignment_id is required")
+
+        previous: dict[str, Any] | None = None
+        previous_dir = self._resume_checkpoint_path
+        if previous_dir is not None:
+            previous = load_manifest(previous_dir / "checkpoint.json")
+            if previous["assignment_id"] != self._checkpoint_assignment_id:
+                raise CheckpointIncompatibleError("checkpoint assignment does not match")
+
+        base_commit = await self._current_base_commit(environment, env)
+        checkpoint_dir = self._checkpoint_host_dir
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, mode=0o700)
+        self._checkpoint_manifest_path = checkpoint_dir / "checkpoint.json"
+
+        if previous_dir is not None and (previous_dir / "events.jsonl").is_file():
+            shutil.copy2(previous_dir / "events.jsonl", checkpoint_dir / "events.jsonl")
+
+        manifest = new_manifest(
+            assignment_id=self._checkpoint_assignment_id,
+            model=self.model_name,
+            task_id=self._checkpoint_task_id,
+            effort=self._checkpoint_effort,
+            base_commit=base_commit,
+            resume_generation=self._checkpoint_resume_generation,
+            checkpoint_id=previous.get("checkpoint_id") if previous else None,
+            resume_count=int(previous.get("resume_count", 0)) + (1 if previous else 0),
+        )
+        write_manifest(self._checkpoint_manifest_path, manifest)
+        (checkpoint_dir / "base_commit").write_text(base_commit + "\n")
+        script_path = checkpoint_dir / "snapshot.sh"
+        script_path.write_text(
+            snapshot_script(
+                workdir=self._checkpoint_workdir,
+                checkpoint_dir=str(self._checkpoint_remote_dir),
+                codex_home=str(self._REMOTE_CODEX_HOME),
+                interval_sec=self._checkpoint_interval_sec,
+            )
+        )
+        script_path.chmod(0o700)
+        self._checkpoint_event(
+            "checkpoint_started", resumed=bool(previous), base_commit=base_commit
+        )
+
+        if previous is not None and previous_dir is not None:
+            try:
+                await self._restore_checkpoint(
+                    environment, env, previous_dir, previous, base_commit
+                )
+            except Exception as exc:
+                update_manifest(
+                    self._checkpoint_manifest_path,
+                    phase="incompatible",
+                    failure_type=type(exc).__name__,
+                )
+                self._checkpoint_event(
+                    "restore_rejected", failure_type=type(exc).__name__
+                )
+                raise
+
+        remote_script = self._checkpoint_remote_dir / "snapshot.sh"
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"nohup sh {shlex.quote(str(remote_script))} "
+                f">{shlex.quote(str(self._checkpoint_remote_dir / 'snapshot.log'))} "
+                f"2>&1 & echo $! >"
+                f"{shlex.quote(str(self._checkpoint_remote_dir / 'snapshot.pid'))}"
+            ),
+            env=env,
+        )
+        root = self._checkpoint_root_thread_id(previous_dir) if previous_dir else None
+        if root:
+            update_manifest(self._checkpoint_manifest_path, root_thread_id=root)
+        return previous, root
+
+    async def _finish_checkpoint(
+        self,
+        environment: BaseEnvironment,
+        env: dict[str, str],
+        *,
+        completed: bool,
+        failure: BaseException | None,
+    ) -> None:
+        if not self._checkpoint_enabled or self._checkpoint_manifest_path is None:
+            return
+        remote_dir = self._checkpoint_remote_dir
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"if [ -f {shlex.quote(str(remote_dir / 'snapshot.pid'))} ]; then "
+                    f"kill $(cat {shlex.quote(str(remote_dir / 'snapshot.pid'))}) "
+                    "2>/dev/null || true; fi; "
+                    f"sh {shlex.quote(str(remote_dir / 'snapshot.sh'))} --once"
+                ),
+                env=env,
+            )
+        except Exception:
+            self.logger.warning("Final Codex checkpoint snapshot failed", exc_info=True)
+
+        output_path = self.logs_dir / self._OUTPUT_FILENAME
+        root = None
+        if output_path.is_file():
+            root = _root_thread_id(output_path.read_text(errors="replace"))
+        if not root:
+            try:
+                existing = load_manifest(self._checkpoint_manifest_path)
+                root = existing.get("root_thread_id")
+            except CheckpointError:
+                pass
+        secret_marker = self._checkpoint_host_dir / "invalid-secret"
+        phase = (
+            "invalid"
+            if secret_marker.is_file()
+            else ("agent_completed" if completed else "paused")
+        )
+        changes: dict[str, Any] = {"phase": phase, "root_thread_id": root}
+        if secret_marker.is_file():
+            changes["failure_type"] = "CheckpointSecretDetected"
+        if failure is not None:
+            changes["failure_type"] = type(failure).__name__
+        update_manifest(self._checkpoint_manifest_path, **changes)
+        self._checkpoint_event(
+            phase,
+            root_thread_available=bool(root),
+            failure_type=type(failure).__name__ if failure else None,
+        )
+
     async def _run_with_capacity_resume(
         self,
         environment: BaseEnvironment,
         initial_command: str,
         resume_command_prefix: str,
         env: dict[str, str],
+        root_thread_id: str | None = None,
     ) -> None:
         output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
 
@@ -1122,7 +1428,7 @@ class Codex(BaseInstalledAgent):
             command=f"head -n 100 {shlex.quote(output_path)} 2>/dev/null || true",
             env=env,
         )
-        thread_id = _root_thread_id(thread_result.stdout or "")
+        thread_id = _root_thread_id(thread_result.stdout or "") or root_thread_id
         if thread_id is None:
             raise last_error
 
@@ -1131,6 +1437,12 @@ class Codex(BaseInstalledAgent):
             "finish the task."
         )
         for attempt, delay in enumerate(_MODEL_CAPACITY_RETRY_DELAYS, start=1):
+            self._checkpoint_event(
+                "transient_retry",
+                reason="model_capacity",
+                attempt=attempt,
+                delay_seconds=delay,
+            )
             self.logger.warning(
                 "Codex model capacity failure; resuming root thread %s in %ss "
                 "(attempt %s/%s)",
@@ -1255,6 +1567,7 @@ class Codex(BaseInstalledAgent):
                 command=setup_command,
                 env=env,
             )
+        previous_checkpoint, resume_root = await self._start_checkpoint(environment, env)
         codex_command_prefix = (
             "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; codex exec "
         )
@@ -1267,19 +1580,100 @@ class Codex(BaseInstalledAgent):
             f"{cli_flags_arg}"
         )
         output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
+        resume_command_prefix = f"{codex_command_prefix}resume {codex_options}"
         initial_command = (
             f"{codex_command_prefix}{codex_options}-- {escaped_instruction} "
             f"2>&1 </dev/null | tee {shlex.quote(output_path)}"
         )
-        resume_command_prefix = f"{codex_command_prefix}resume {codex_options}"
+
+        completed = False
+        failure: BaseException | None = None
 
         try:
-            await self._run_with_capacity_resume(
-                environment,
-                initial_command=initial_command,
-                resume_command_prefix=resume_command_prefix,
-                env=env,
-            )
+            should_fallback = False
+            if previous_checkpoint is not None:
+                previous_dir = self._resume_checkpoint_path
+                sessions_rel = str(previous_checkpoint.get("sessions_dir", "sessions"))
+                sessions_available = bool(
+                    previous_dir is not None and (previous_dir / sessions_rel).is_dir()
+                )
+                if resume_root and sessions_available:
+                    self._checkpoint_event("session_resume_started")
+                    continuation = shlex.quote(
+                        "Continue from the interrupted turn. Inspect the restored "
+                        "workspace, verify what remains, and finish the task without "
+                        "redoing completed work."
+                    )
+                    resume_initial = (
+                        f"{resume_command_prefix}{shlex.quote(resume_root)} "
+                        f"{continuation} 2>&1 </dev/null | tee "
+                        f"{shlex.quote(output_path)}"
+                    )
+                    try:
+                        await self._run_with_capacity_resume(
+                            environment,
+                            initial_command=resume_initial,
+                            resume_command_prefix=resume_command_prefix,
+                            env=env,
+                            root_thread_id=resume_root,
+                        )
+                        self._checkpoint_event("session_resume_succeeded")
+                    except NonZeroAgentExitCodeError:
+                        if not self._session_unavailable():
+                            raise
+                        should_fallback = True
+                else:
+                    should_fallback = True
+
+                if should_fallback:
+                    summary = ""
+                    if previous_dir is not None:
+                        summary_path = safe_artifact_path(
+                            previous_dir, "progress-summary.txt"
+                        )
+                        if summary_path.is_file():
+                            summary = summary_path.read_text(errors="replace")[:4000]
+                    self._checkpoint_event(
+                        "session_resume_degraded",
+                        reason="session_unavailable",
+                        progress_summary_available=bool(summary),
+                    )
+                    await self.exec_as_agent(
+                        environment,
+                        command='rm -rf "$CODEX_HOME/sessions"',
+                        env=env,
+                    )
+                    fallback_instruction = (
+                        instruction
+                        + "\n\nThe previous Codex session could not be restored, but its "
+                        "workspace was restored from a persistent checkpoint. Inspect "
+                        "git status and git diff, keep the existing progress, and finish "
+                        "the remaining work. Do not redo completed steps.\n\n"
+                        + (f"Checkpoint progress summary:\n{summary}" if summary else "")
+                    )
+                    fallback_initial = (
+                        f"{codex_command_prefix}{codex_options}-- "
+                        f"{shlex.quote(fallback_instruction)} 2>&1 </dev/null | tee "
+                        f"{shlex.quote(output_path)}"
+                    )
+                    await self._run_with_capacity_resume(
+                        environment,
+                        initial_command=fallback_initial,
+                        resume_command_prefix=resume_command_prefix,
+                        env=env,
+                    )
+                    self._checkpoint_event("fallback_session_succeeded")
+            else:
+                await self._run_with_capacity_resume(
+                    environment,
+                    initial_command=initial_command,
+                    resume_command_prefix=resume_command_prefix,
+                    env=env,
+                )
+            completed = True
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             try:
                 await self.exec_as_agent(
@@ -1299,6 +1693,17 @@ class Codex(BaseInstalledAgent):
                 )
             except Exception:
                 pass
+            try:
+                await asyncio.shield(
+                    self._finish_checkpoint(
+                        environment,
+                        env,
+                        completed=completed,
+                        failure=failure,
+                    )
+                )
+            except BaseException:
+                self.logger.warning("Could not finalize Codex checkpoint", exc_info=True)
             # cleanup - best effort
             try:
                 await self.exec_as_agent(

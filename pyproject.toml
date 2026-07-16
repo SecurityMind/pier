@@ -1,6 +1,6 @@
 [project]
 name = "datacurve-pier"
-version = "0.3.0.post1"
+version = "0.3.0.post2"
 description = "A framework for running coding agents in sandboxed environments and keeping full trajectories for analysis."
 readme = "README.md"
 license = "Apache-2.0"

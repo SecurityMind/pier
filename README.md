@@ -14,6 +14,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 - **Augmented ATIF v1.7.** Strict one step per API turn, strict reasoning vs agent message separation, no fabricated assistant text, `peak_context_tokens`, `summarization_count`, `llm_call_count`, real upstream timestamps.
 - **A chat-style trajectory viewer** (`pier view`).
 - **`pier critique run`** for inspecting completed trials with a fresh agent in a fresh sandbox.
+- **Codex persistent checkpoints.** Opt-in agent kwargs snapshot repository progress and Codex sessions into the trial log mount, then restore the exact session (or safely degrade to a new session over the restored workspace) after a process or machine restart. Credential files are never copied; credential-shaped workspace data invalidates the checkpoint.
 
 ## What works today
 
@@ -76,6 +77,13 @@ A few things we've learned plumbing this through Respan and OpenRouter:
 ```
 
 **Codex** needs a `[model_providers.<name>]` block with `wire_api = "responses"` (not WebSockets, which Codex defaults to and Respan doesn't speak).
+
+For an orchestrator-managed resumable run, pass `checkpoint_enabled=true`, a
+credential-free `checkpoint_assignment_id`, and optionally `checkpoint_path`
+pointing at a previous trial's `agent/checkpoint` directory. The orchestrator
+should fence concurrent recovery and delete the checkpoint only after its
+submission is acknowledged; Pier never stores account credentials or a server
+submission nonce in the manifest.
 
 ```yaml
 - name: codex
