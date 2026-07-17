@@ -149,6 +149,29 @@ def test_snapshot_rejects_secret_patch_and_omits_secret_session(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_start_checkpoint_without_previous_checkpoint(tmp_path: Path):
+    agent = Codex(
+        logs_dir=tmp_path / "logs",
+        model_name="openai/gpt-test",
+        checkpoint_enabled=True,
+        checkpoint_assignment_id="a1",
+    )
+    agent._current_base_commit = AsyncMock(return_value="base")
+    agent.exec_as_agent = AsyncMock(return_value=SimpleNamespace(stdout=""))
+
+    previous, resume_root = await agent._start_checkpoint(
+        environment=object(), env={}
+    )
+
+    assert previous is None
+    assert resume_root is None
+    manifest = load_manifest(tmp_path / "logs" / "checkpoint" / "checkpoint.json")
+    assert manifest["resume_count"] == 0
+    assert manifest["assignment_id"] == "a1"
+    agent.exec_as_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_restore_rejects_a_changed_task_base(tmp_path: Path):
     previous_dir = tmp_path / "previous"
     previous_dir.mkdir()
