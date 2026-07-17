@@ -1296,7 +1296,11 @@ class Codex(BaseInstalledAgent):
             base_commit=base_commit,
             resume_generation=self._checkpoint_resume_generation,
             checkpoint_id=previous.get("checkpoint_id") if previous else None,
-            resume_count=int(previous.get("resume_count", 0)) + (1 if previous else 0),
+            resume_count=(
+                int(previous.get("resume_count", 0)) + 1
+                if previous is not None
+                else 0
+            ),
         )
         write_manifest(self._checkpoint_manifest_path, manifest)
         (checkpoint_dir / "base_commit").write_text(base_commit + "\n")
