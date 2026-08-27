@@ -469,6 +469,32 @@ class DockerEnvironment(BaseEnvironment):
             command.append("--no-cache")
         return command
 
+    @staticmethod
+    async def _terminate_compose_process(
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Boundedly reap a compose subprocess after timeout or cancellation.
+
+        ``asyncio.wait_for`` cancels the coroutine it is waiting on.  Without
+        explicitly reaping the child, cancelling ``docker compose exec`` can
+        leave both the client process and the command inside the task
+        container running after Pier has moved on to trial finalization.
+        """
+        if process.returncode is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            await process.communicate()
+
     async def _run_docker_compose_command(
         self, command: list[str], check: bool = True, timeout_sec: int | None = None
     ) -> ExecResult:
@@ -509,15 +535,15 @@ class DockerEnvironment(BaseEnvironment):
                 )
             else:
                 stdout_bytes, stderr_bytes = await process.communicate()
+        except asyncio.CancelledError:
+            # Agent-level wait_for cancellation is not a compose timeout, but
+            # it has the same child-process ownership requirement. Reap before
+            # propagating cancellation so Trial cleanup is the only remaining
+            # owner of the task container.
+            await self._terminate_compose_process(process)
+            raise
         except asyncio.TimeoutError:
-            process.terminate()
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=5
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                stdout_bytes, stderr_bytes = await process.communicate()
+            await self._terminate_compose_process(process)
             raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
 
         stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
